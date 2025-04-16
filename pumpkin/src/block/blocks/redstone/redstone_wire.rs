@@ -1,16 +1,17 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use pumpkin_data::block::BlockProperties;
 use pumpkin_data::block::{
     Block, BlockState, EastWireConnection, EnumVariants, Integer0To15, NorthWireConnection,
     ObserverLikeProperties, RedstoneWireLikeProperties, RepeaterLikeProperties,
     SouthWireConnection, WestWireConnection,
 };
-use pumpkin_data::block::{BlockProperties, HorizontalFacing};
 use pumpkin_data::item::Item;
 use pumpkin_macros::pumpkin_block;
 use pumpkin_protocol::server::play::SUseItemOn;
 use pumpkin_util::math::position::BlockPos;
+use pumpkin_world::BlockStateId;
 use pumpkin_world::block::{BlockDirection, HorizontalFacingExt};
 
 use crate::block::registry::BlockActionResult;
@@ -44,12 +45,12 @@ impl PumpkinBlock for RedstoneWireBlock {
         _face: &BlockDirection,
         block_pos: &BlockPos,
         _use_item_on: &SUseItemOn,
-        _player_direction: &HorizontalFacing,
+        _player: &Player,
         _other: bool,
-    ) -> u16 {
+    ) -> BlockStateId {
         let mut wire = RedstoneWireProperties::default(block);
-        wire.power = Integer0To15::from_index(calculate_power(world, *block_pos).await.into());
-        wire = get_regulated_sides(wire, world, *block_pos).await;
+        wire.power = Integer0To15::from_index(calculate_power(world, block_pos).await.into());
+        wire = get_regulated_sides(wire, world, block_pos).await;
         if is_dot(wire) {
             wire = make_cross(wire.power);
         }
@@ -61,12 +62,12 @@ impl PumpkinBlock for RedstoneWireBlock {
         &self,
         world: &World,
         block: &Block,
-        state: u16,
+        state: BlockStateId,
         block_pos: &BlockPos,
         direction: &BlockDirection,
         _neighbor_pos: &BlockPos,
-        _neighbor_state: u16,
-    ) -> u16 {
+        _neighbor_state: BlockStateId,
+    ) -> BlockStateId {
         let mut wire = RedstoneWireProperties::from_state_id(state, block);
         let old_state = wire;
         let new_side: WireConnection;
@@ -76,33 +77,33 @@ impl PumpkinBlock for RedstoneWireBlock {
                 return state;
             }
             BlockDirection::Down => {
-                return get_regulated_sides(wire, world, *block_pos)
+                return get_regulated_sides(wire, world, block_pos)
                     .await
                     .to_state_id(block);
             }
             BlockDirection::North => {
-                let side = get_side(world, *block_pos, BlockDirection::North).await;
+                let side = get_side(world, block_pos, BlockDirection::North).await;
                 wire.north = side.to_north();
                 new_side = side;
             }
             BlockDirection::South => {
-                let side = get_side(world, *block_pos, BlockDirection::South).await;
+                let side = get_side(world, block_pos, BlockDirection::South).await;
                 wire.south = side.to_south();
                 new_side = side;
             }
             BlockDirection::East => {
-                let side = get_side(world, *block_pos, BlockDirection::East).await;
+                let side = get_side(world, block_pos, BlockDirection::East).await;
                 wire.east = side.to_east();
                 new_side = side;
             }
             BlockDirection::West => {
-                let side = get_side(world, *block_pos, BlockDirection::West).await;
+                let side = get_side(world, block_pos, BlockDirection::West).await;
                 wire.west = side.to_west();
                 new_side = side;
             }
         }
 
-        wire = get_regulated_sides(wire, world, *block_pos).await;
+        wire = get_regulated_sides(wire, world, block_pos).await;
         if is_cross(old_state) && new_side.is_none() {
             return wire.to_state_id(block);
         }
@@ -115,10 +116,10 @@ impl PumpkinBlock for RedstoneWireBlock {
 
     async fn prepare(
         &self,
-        world: &World,
+        world: &Arc<World>,
         block_pos: &BlockPos,
         _block: &Block,
-        state_id: u16,
+        state_id: BlockStateId,
         flags: BlockFlags,
     ) {
         let wire_props = RedstoneWireLikeProperties::from_state_id(state_id, &Block::REDSTONE_WIRE);
@@ -161,11 +162,11 @@ impl PumpkinBlock for RedstoneWireBlock {
         _player: &Player,
         location: BlockPos,
         _server: &Server,
-        world: &World,
+        world: &Arc<World>,
     ) {
         let state = world.get_block_state(&location).await.unwrap();
         let wire = RedstoneWireProperties::from_state_id(state.id, block);
-        on_use(wire, world, location).await;
+        on_use(wire, world, &location).await;
     }
 
     async fn use_with_item(
@@ -175,11 +176,11 @@ impl PumpkinBlock for RedstoneWireBlock {
         location: BlockPos,
         _item: &Item,
         _server: &Server,
-        world: &World,
+        world: &Arc<World>,
     ) -> BlockActionResult {
         let state = world.get_block_state(&location).await.unwrap();
         let wire = RedstoneWireProperties::from_state_id(state.id, block);
-        if on_use(wire, world, location).await {
+        if on_use(wire, world, &location).await {
             BlockActionResult::Consume
         } else {
             BlockActionResult::Continue
@@ -188,25 +189,29 @@ impl PumpkinBlock for RedstoneWireBlock {
 
     async fn on_neighbor_update(
         &self,
-        world: &World,
+        world: &Arc<World>,
         block: &Block,
-        block_pos: &BlockPos,
+        pos: &BlockPos,
         _source_block: &Block,
         _notify: bool,
     ) {
-        let state = world.get_block_state(block_pos).await.unwrap();
-        let mut wire = RedstoneWireProperties::from_state_id(state.id, block);
-        let new_power = calculate_power(world, *block_pos).await;
-        if wire.power.to_index() as u8 != new_power {
-            wire.power = Integer0To15::from_index(new_power.into());
-            world
-                .set_block_state(
-                    block_pos,
-                    wire.to_state_id(&Block::REDSTONE_WIRE),
-                    BlockFlags::empty(),
-                )
-                .await;
-            RedstoneWireTurbo::update_surrounding_neighbors(world, *block_pos).await;
+        if self.can_place_at(world, pos).await {
+            let state = world.get_block_state(pos).await.unwrap();
+            let mut wire = RedstoneWireProperties::from_state_id(state.id, block);
+            let new_power = calculate_power(world, pos).await;
+            if wire.power.to_index() as u8 != new_power {
+                wire.power = Integer0To15::from_index(new_power.into());
+                world
+                    .set_block_state(
+                        pos,
+                        wire.to_state_id(&Block::REDSTONE_WIRE),
+                        BlockFlags::empty(),
+                    )
+                    .await;
+                RedstoneWireTurbo::update_surrounding_neighbors(world, *pos).await;
+            }
+        } else {
+            world.break_block(pos, None, BlockFlags::NOTIFY_ALL).await;
         }
     }
 
@@ -219,7 +224,7 @@ impl PumpkinBlock for RedstoneWireBlock {
         direction: &BlockDirection,
     ) -> u8 {
         let wire = RedstoneWireProperties::from_state_id(state.id, block);
-        if *direction == BlockDirection::Up || wire.is_side_connected(direction.opposite()) {
+        if direction == &BlockDirection::Up || wire.is_side_connected(direction.opposite()) {
             wire.power.to_index() as u8
         } else {
             0
@@ -235,7 +240,7 @@ impl PumpkinBlock for RedstoneWireBlock {
         direction: &BlockDirection,
     ) -> u8 {
         let wire = RedstoneWireProperties::from_state_id(state.id, block);
-        if *direction == BlockDirection::Up || wire.is_side_connected(direction.opposite()) {
+        if direction == &BlockDirection::Up || wire.is_side_connected(direction.opposite()) {
             wire.power.to_index() as u8
         } else {
             0
@@ -244,14 +249,14 @@ impl PumpkinBlock for RedstoneWireBlock {
 
     async fn placed(
         &self,
-        world: &World,
+        world: &Arc<World>,
         _block: &Block,
-        _state_id: u16,
+        _state_id: BlockStateId,
         block_pos: &BlockPos,
-        _old_state_id: u16,
+        _old_state_id: BlockStateId,
         _notify: bool,
     ) {
-        update_wire_neighbors(world, *block_pos).await;
+        update_wire_neighbors(world, block_pos).await;
     }
 
     async fn broken(
@@ -263,11 +268,11 @@ impl PumpkinBlock for RedstoneWireBlock {
         world: Arc<World>,
         _state: BlockState,
     ) {
-        update_wire_neighbors(&world, location).await;
+        update_wire_neighbors(&world, &location).await;
     }
 }
 
-async fn on_use(wire: RedstoneWireProperties, world: &World, block_pos: BlockPos) -> bool {
+async fn on_use(wire: RedstoneWireProperties, world: &Arc<World>, block_pos: &BlockPos) -> bool {
     if is_cross(wire) || is_dot(wire) {
         let mut new_wire = if is_cross(wire) {
             RedstoneWireProperties::default(&Block::REDSTONE_WIRE)
@@ -280,7 +285,7 @@ async fn on_use(wire: RedstoneWireProperties, world: &World, block_pos: BlockPos
         if wire != new_wire {
             world
                 .set_block_state(
-                    &block_pos,
+                    block_pos,
                     new_wire.to_state_id(&Block::REDSTONE_WIRE),
                     BlockFlags::empty(),
                 )
@@ -315,24 +320,24 @@ async fn can_connect_to(
     {
         return true;
     }
-    if *block == Block::REPEATER {
+    if block == &Block::REPEATER {
         let repeater_props = RepeaterLikeProperties::from_state_id(state.id, block);
         return repeater_props.facing.to_block_direction() == side
             || repeater_props.facing.to_block_direction() == side.opposite();
-    } else if *block == Block::OBSERVER {
+    } else if block == &Block::OBSERVER {
         let observer_props = ObserverLikeProperties::from_state_id(state.id, block);
         return observer_props.facing == side.to_facing();
-    } else if *block == Block::REDSTONE_WIRE {
+    } else if block == &Block::REDSTONE_WIRE {
         return true;
     }
     false
 }
 
 fn can_connect_diagonal_to(block: &Block) -> bool {
-    *block == Block::REDSTONE_WIRE
+    block == &Block::REDSTONE_WIRE
 }
 
-pub async fn get_side(world: &World, pos: BlockPos, side: BlockDirection) -> WireConnection {
+pub async fn get_side(world: &World, pos: &BlockPos, side: BlockDirection) -> WireConnection {
     let neighbor_pos: BlockPos = pos.offset(side.to_offset());
     let (neighbor, state) = world
         .get_block_and_block_state(&neighbor_pos)
@@ -372,7 +377,7 @@ pub async fn get_side(world: &World, pos: BlockPos, side: BlockDirection) -> Wir
 async fn get_all_sides(
     mut wire: RedstoneWireProperties,
     world: &World,
-    pos: BlockPos,
+    pos: &BlockPos,
 ) -> RedstoneWireProperties {
     wire.north = get_side(world, pos, BlockDirection::North).await.to_north();
     wire.south = get_side(world, pos, BlockDirection::South).await.to_south();
@@ -398,7 +403,7 @@ pub fn is_cross(wire: RedstoneWireProperties) -> bool {
 pub async fn get_regulated_sides(
     wire: RedstoneWireProperties,
     world: &World,
-    pos: BlockPos,
+    pos: &BlockPos,
 ) -> RedstoneWireProperties {
     let mut state = get_all_sides(wire, world, pos).await;
     if is_dot(wire) && is_dot(state) {
@@ -573,7 +578,7 @@ async fn max_wire_power(wire_power: u8, world: &World, pos: BlockPos) -> u8 {
     }
 }
 
-async fn calculate_power(world: &World, pos: BlockPos) -> u8 {
+async fn calculate_power(world: &World, pos: &BlockPos) -> u8 {
     let mut block_power: u8 = 0;
     let mut wire_power: u8 = 0;
 
@@ -588,8 +593,7 @@ async fn calculate_power(world: &World, pos: BlockPos) -> u8 {
             .await
             .unwrap();
         block_power = block_power.max(
-            get_redstone_power_no_dust(&neighbor, &neighbor_state, world, neighbor_pos, *side)
-                .await,
+            get_redstone_power_no_dust(&neighbor, &neighbor_state, world, neighbor_pos, side).await,
         );
         if side.is_horizontal() {
             if !up_state.is_solid

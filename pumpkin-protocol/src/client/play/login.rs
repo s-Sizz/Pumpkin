@@ -11,7 +11,6 @@ use crate::{VarInt, codec::identifier::Identifier};
 pub struct CLogin<'a> {
     entity_id: i32,
     is_hardcore: bool,
-    dimension_count: VarInt,
     dimension_names: &'a [Identifier],
     max_players: VarInt,
     view_distance: VarInt,
@@ -22,6 +21,7 @@ pub struct CLogin<'a> {
     // Spawn info
     dimension_type: VarInt,
     dimension_name: Identifier,
+    /// First 8 bytes of the SHA-256 hash of the world's seed. Used client side for biome noise
     hashed_seed: i64,
     game_mode: u8,
     previous_gamemode: i8,
@@ -60,7 +60,6 @@ impl<'a> CLogin<'a> {
         Self {
             entity_id,
             is_hardcore,
-            dimension_count: VarInt(dimension_names.len() as i32),
             dimension_names,
             max_players,
             view_distance,

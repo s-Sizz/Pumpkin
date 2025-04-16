@@ -56,7 +56,7 @@ use tokio::{
 use thiserror::Error;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
-mod authentication;
+pub mod authentication;
 mod container;
 pub mod lan_broadcast;
 mod packet;
@@ -108,7 +108,7 @@ impl Default for PlayerConfig {
     fn default() -> Self {
         Self {
             locale: "en_us".to_string(),
-            view_distance: unsafe { NonZeroU8::new_unchecked(10) },
+            view_distance: NonZeroU8::new(10).unwrap(),
             chat_mode: ChatMode::Enabled,
             chat_colors: true,
             skin_parts: 0,
@@ -218,11 +218,7 @@ impl Client {
                 if let Err(err) = writer.lock().await.write_packet(packet_data).await {
                     // It is expected that the packet will fail if we are closed
                     if !closed.load(std::sync::atomic::Ordering::Relaxed) {
-                        log::warn!(
-                            "Failed to send packet to client {}: {}",
-                            id,
-                            err.to_string()
-                        );
+                        log::warn!("Failed to send packet to client {id}: {err}",);
                         // We now need to close the connection to the client since the stream is in an
                         // unknown state
                         Self::thread_safe_close(&close_interrupt, &closed);
@@ -370,7 +366,7 @@ impl Client {
                 log::error!(
                     "Failed to add packet to the outgoing packet queue for client {}: {}",
                     self.id,
-                    err.to_string()
+                    err
                 );
             }
         }
@@ -396,7 +392,7 @@ impl Client {
         if let Err(err) = packet.write(&mut packet_buf) {
             log::error!("Failed to serialize packet {}: {}", P::PACKET_ID, err);
             return;
-        };
+        }
 
         if let Err(err) = self
             .network_writer
@@ -407,11 +403,7 @@ impl Client {
         {
             // It is expected that the packet will fail if we are closed
             if !self.closed.load(std::sync::atomic::Ordering::Relaxed) {
-                log::warn!(
-                    "Failed to send packet to client {}: {}",
-                    self.id,
-                    err.to_string()
-                );
+                log::warn!("Failed to send packet to client {}: {}", self.id, err);
                 // We now need to close the connection to the client since the stream is in an
                 // unknown state
                 self.close();
@@ -445,7 +437,7 @@ impl Client {
                     error
                 );
                 self.kick(TextComponent::text(text)).await;
-            };
+            }
         }
     }
 
@@ -513,7 +505,7 @@ impl Client {
                     packet.id
                 );
             }
-        };
+        }
         Ok(())
     }
 
@@ -538,7 +530,7 @@ impl Client {
                     packet.id
                 );
             }
-        };
+        }
 
         Ok(())
     }
@@ -575,7 +567,7 @@ impl Client {
                     packet.id
                 );
             }
-        };
+        }
         Ok(())
     }
 
@@ -615,7 +607,7 @@ impl Client {
                     packet.id
                 );
             }
-        };
+        }
         Ok(())
     }
 
@@ -629,7 +621,7 @@ impl Client {
     pub async fn kick(&self, reason: TextComponent) {
         match self.connection_state.load() {
             ConnectionState::Login => {
-                // TextComponent implements Serialze and writes in bytes instead of String, thats the reasib we only use content
+                // TextComponent implements Serialize and writes in bytes instead of String, that's the reasib we only use content
                 self.send_packet_now(&CLoginDisconnect::new(
                     &serde_json::to_string(&reason.0).unwrap_or_else(|_| String::new()),
                 ))
@@ -645,7 +637,7 @@ impl Client {
                 log::warn!("Can't kick in {:?} State", self.connection_state);
                 return;
             }
-        };
+        }
         log::debug!("Closing connection for {}", self.id);
         self.close();
     }

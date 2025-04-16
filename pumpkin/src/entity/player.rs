@@ -4,11 +4,32 @@ use std::{
     ops::AddAssign,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
 
+use super::living::LivingEntity;
+use super::{
+    Entity, EntityBase, EntityId, NBTStorage,
+    combat::{self, AttackType, player_attack_sound},
+    effect::Effect,
+    hunger::HungerManager,
+    item::ItemEntity,
+};
+use crate::{
+    block,
+    command::{client_suggestions, dispatcher::CommandDispatcher},
+    data::op_data::OPERATOR_CONFIG,
+    net::{Client, PlayerConfig},
+    plugin::player::{
+        player_change_world::PlayerChangeWorldEvent,
+        player_gamemode_change::PlayerGamemodeChangeEvent, player_teleport::PlayerTeleportEvent,
+    },
+    server::Server,
+    world::World,
+};
+use crate::{error::PumpkinError, net::GameProfile};
 use async_trait::async_trait;
 use crossbeam::atomic::AtomicCell;
 use pumpkin_config::{BASIC_CONFIG, advanced_config};
@@ -20,9 +41,14 @@ use pumpkin_data::{
     particle::Particle,
     sound::{Sound, SoundCategory},
 };
-use pumpkin_inventory::player::PlayerInventory;
+use pumpkin_inventory::player::{
+    PlayerInventory, SLOT_BOOT, SLOT_CRAFT_INPUT_END, SLOT_CRAFT_INPUT_START, SLOT_HELM,
+    SLOT_HOTBAR_END, SLOT_INV_START, SLOT_OFFHAND,
+};
 use pumpkin_macros::send_cancellable;
 use pumpkin_nbt::compound::NbtCompound;
+use pumpkin_nbt::tag::NbtTag;
+use pumpkin_protocol::client::play::{CSetHeldItem, PlayerInfoFlags, PreviousMessage};
 use pumpkin_protocol::{
     IdOr, RawPacket, ServerPacket,
     client::play::{
@@ -38,8 +64,8 @@ use pumpkin_protocol::{
         SChatCommand, SChatMessage, SChunkBatch, SClientCommand, SClientInformationPlay,
         SClientTickEnd, SCommandSuggestion, SConfirmTeleport, SInteract, SPickItemFromBlock,
         SPlayerAbilities, SPlayerAction, SPlayerCommand, SPlayerInput, SPlayerPosition,
-        SPlayerPositionRotation, SPlayerRotation, SSetCreativeSlot, SSetHeldItem, SSetPlayerGround,
-        SSwingArm, SUpdateSign, SUseItem, SUseItemOn,
+        SPlayerPositionRotation, SPlayerRotation, SPlayerSession, SSetCreativeSlot, SSetHeldItem,
+        SSetPlayerGround, SSwingArm, SUpdateSign, SUseItem, SUseItemOn,
     },
 };
 use pumpkin_protocol::{
@@ -64,29 +90,10 @@ use pumpkin_util::{
 };
 use pumpkin_world::{cylindrical_chunk_iterator::Cylindrical, item::ItemStack, level::SyncChunk};
 use tokio::{sync::Mutex, task::JoinHandle};
+use uuid::Uuid;
 
-use super::{
-    Entity, EntityBase, EntityId, NBTStorage,
-    combat::{self, AttackType, player_attack_sound},
-    effect::Effect,
-    hunger::HungerManager,
-    item::ItemEntity,
-};
-use crate::{
-    block,
-    command::{client_suggestions, dispatcher::CommandDispatcher},
-    data::op_data::OPERATOR_CONFIG,
-    net::{Client, PlayerConfig},
-    plugin::player::{
-        player_change_world::PlayerChangeWorldEvent,
-        player_gamemode_change::PlayerGamemodeChangeEvent, player_teleport::PlayerTeleportEvent,
-    },
-    server::Server,
-    world::World,
-};
-use crate::{error::PumpkinError, net::GameProfile};
-
-use super::living::LivingEntity;
+const MAX_CACHED_SIGNATURES: u8 = 128; // Vanilla: 128
+const MAX_PREVIOUS_MESSAGES: u8 = 20; // Vanilla: 20
 
 enum BatchState {
     Initial,
@@ -210,6 +217,11 @@ pub struct Player {
     pub last_keep_alive_time: AtomicCell<Instant>,
     /// The amount of ticks since the player's last attack.
     pub last_attacked_ticks: AtomicU32,
+    /// The player's last known experience level.
+    pub last_sent_xp: AtomicI32,
+    pub last_sent_health: AtomicI32,
+    pub last_sent_food: AtomicU8,
+    pub last_food_saturation: AtomicBool,
     /// The player's permission level.
     pub permission_lvl: AtomicCell<PermissionLvl>,
     /// Whether the client has reported that it has loaded.
@@ -224,6 +236,9 @@ pub struct Player {
     pub experience_points: AtomicI32,
     pub experience_pick_up_delay: Mutex<u32>,
     pub chunk_manager: Mutex<ChunkManager>,
+    pub has_played_before: AtomicBool,
+    pub chat_session: Arc<Mutex<ChatSession>>,
+    pub signature_cache: Mutex<MessageCache>,
 }
 
 impl Player {
@@ -276,7 +291,7 @@ impl Player {
             // (We left shift by one so we can search around that chunk)
             watched_section: AtomicCell::new(Cylindrical::new(
                 Vector2::new(i32::MAX >> 1, i32::MAX >> 1),
-                unsafe { NonZeroU8::new_unchecked(1) },
+                NonZeroU8::new(1).unwrap(),
             )),
             wait_for_keep_alive: AtomicBool::new(false),
             keep_alive_id: AtomicI64::new(0),
@@ -302,6 +317,13 @@ impl Player {
             experience_points: AtomicI32::new(0),
             // Default to sending 16 chunks per tick.
             chunk_manager: Mutex::new(ChunkManager::new(16)),
+            last_sent_xp: AtomicI32::new(-1),
+            last_sent_health: AtomicI32::new(-1),
+            last_sent_food: AtomicU8::new(0),
+            last_food_saturation: AtomicBool::new(true),
+            has_played_before: AtomicBool::new(false),
+            chat_session: Arc::new(Mutex::new(ChatSession::default())), // Placeholder value until the player actually sets their session id
+            signature_cache: Mutex::new(MessageCache::default()),
         }
     }
 
@@ -382,8 +404,8 @@ impl Player {
         // Get the attack damage
         if let Some(item_stack) = item_slot {
             // TODO: this should be cached in memory
-            if let Some(modifiers) = &item_stack.item.components.attribute_modifiers {
-                for item_mod in modifiers.modifiers {
+            if let Some(modifiers) = item_stack.item.components.attribute_modifiers {
+                for item_mod in modifiers {
                     if item_mod.operation == Operation::AddValue {
                         if item_mod.id == "minecraft:base_attack_damage" {
                             add_damage = item_mod.amount;
@@ -442,7 +464,7 @@ impl Player {
                     combat::spawn_sweep_particle(attacker_entity, &world, &pos).await;
                 }
                 _ => {}
-            };
+            }
             if config.knockback {
                 combat::handle_knockback(
                     attacker_entity,
@@ -471,7 +493,7 @@ impl Player {
         offset: Vector3<f32>,
         max_speed: f32,
         particle_count: i32,
-        pariticle: Particle,
+        particle: Particle,
     ) {
         self.client
             .enqueue_packet(&CParticle::new(
@@ -481,7 +503,7 @@ impl Player {
                 offset,
                 max_speed,
                 particle_count,
-                VarInt(pariticle as i32),
+                VarInt(particle as i32),
                 &[],
             ))
             .await;
@@ -498,7 +520,7 @@ impl Player {
     ) {
         self.client
             .enqueue_packet(&CSoundEffect::new(
-                IdOr::Id(u32::from(sound_id)),
+                IdOr::Id(sound_id),
                 category,
                 position,
                 volume,
@@ -559,7 +581,7 @@ impl Player {
                 self.client.send_packet_now(&CChunkData(&chunk)).await;
             }
             self.client
-                .send_packet_now(&CChunkBatchEnd::new(chunk_count))
+                .send_packet_now(&CChunkBatchEnd::new(chunk_count as u16))
                 .await;
         }
 
@@ -595,6 +617,10 @@ impl Player {
 
         self.living_entity.tick(server).await;
         self.hunger_manager.tick(self).await;
+
+        // experience handling
+        self.tick_experience().await;
+        self.tick_health().await;
 
         // Timeout/keep alive handling
         self.tick_client_load_timeout();
@@ -786,7 +812,7 @@ impl Player {
 
         self.watched_section.store(Cylindrical::new(
             Vector2::new(i32::MAX >> 1, i32::MAX >> 1),
-            unsafe { NonZeroU8::new_unchecked(1) },
+            NonZeroU8::new(1).unwrap(),
         ));
     }
 
@@ -1030,6 +1056,24 @@ impl Player {
             .await;
     }
 
+    pub async fn tick_health(&self) {
+        let health = self.living_entity.health.load() as i32;
+        let food = self.hunger_manager.level.load();
+        let saturation = self.hunger_manager.saturation.load();
+
+        let last_health = self.last_sent_health.load(Ordering::Relaxed);
+        let last_food = self.last_sent_food.load(Ordering::Relaxed);
+        let last_saturation = self.last_food_saturation.load(Ordering::Relaxed);
+
+        if health != last_health || food != last_food || (saturation == 0.0) != last_saturation {
+            self.last_sent_health.store(health, Ordering::Relaxed);
+            self.last_sent_food.store(food, Ordering::Relaxed);
+            self.last_food_saturation
+                .store(saturation == 0.0, Ordering::Relaxed);
+            self.send_health().await;
+        }
+    }
+
     pub async fn set_health(&self, health: f32) {
         self.living_entity.set_health(health).await;
         self.send_health().await;
@@ -1093,8 +1137,7 @@ impl Player {
                     .read()
                     .await
                     .broadcast_packet_all(&CPlayerInfoUpdate::new(
-                        // TODO: Remove magic number
-                        0x04,
+                        PlayerInfoFlags::UPDATE_GAME_MODE.bits(),
                         &[pumpkin_protocol::client::play::Player {
                             uuid: self.gameprofile.id,
                             actions: &[PlayerAction::UpdateGameMode((gamemode as i32).into())],
@@ -1189,7 +1232,7 @@ impl Player {
     pub async fn send_message(
         &self,
         message: &TextComponent,
-        chat_type: u32,
+        chat_type: u8,
         sender_name: &TextComponent,
         target_name: Option<&TextComponent>,
     ) {
@@ -1235,12 +1278,32 @@ impl Player {
             .await;
     }
 
+    pub async fn tick_experience(&self) {
+        let level = self.experience_level.load(Ordering::Relaxed);
+        if self.last_sent_xp.load(Ordering::Relaxed) != level {
+            let progress = self.experience_progress.load();
+            let points = self.experience_points.load(Ordering::Relaxed);
+
+            self.last_sent_xp.store(level, Ordering::Relaxed);
+
+            self.client
+                .send_packet_now(&CSetExperience::new(
+                    progress.clamp(0.0, 1.0),
+                    points.into(),
+                    level.into(),
+                ))
+                .await;
+        }
+    }
+
     /// Sets the player's experience level and notifies the client.
     pub async fn set_experience(&self, level: i32, progress: f32, points: i32) {
         // TODO: These should be atomic together, not isolated; make a struct containing these. can cause ABA issues
         self.experience_level.store(level, Ordering::Relaxed);
         self.experience_progress.store(progress.clamp(0.0, 1.0));
         self.experience_points.store(points, Ordering::Relaxed);
+        self.last_sent_xp.store(-1, Ordering::Relaxed);
+        self.tick_experience().await;
 
         self.client
             .enqueue_packet(&CSetExperience::new(
@@ -1338,29 +1401,58 @@ impl Player {
         let progress = experience::progress_in_level(new_points, new_level);
         self.set_experience(new_level, progress, new_points).await;
     }
+
+    /// Send the player's inventory to the client.
+    pub async fn send_inventory(&self) {
+        self.set_container_content(None).await;
+        self.client
+            .send_packet_now(&CSetHeldItem::new(
+                self.inventory.lock().await.selected as i8,
+            ))
+            .await;
+    }
 }
 
 #[async_trait]
 impl NBTStorage for Player {
     async fn write_nbt(&self, nbt: &mut NbtCompound) {
         self.living_entity.write_nbt(nbt).await;
-        nbt.put_int(
-            "SelectedItemSlot",
-            self.inventory.lock().await.selected as i32,
-        );
+        self.inventory.lock().await.write_nbt(nbt).await;
+
         self.abilities.lock().await.write_nbt(nbt).await;
 
         // Store total XP instead of individual components
         let total_exp = experience::points_to_level(self.experience_level.load(Ordering::Relaxed))
             + self.experience_points.load(Ordering::Relaxed);
         nbt.put_int("XpTotal", total_exp);
+        nbt.put_byte("playerGameType", self.gamemode.load() as i8);
+
+        nbt.put_bool(
+            "HasPlayedBefore",
+            self.has_played_before.load(Ordering::Relaxed),
+        );
+
+        // Store food level, saturation, exhaustion, and tick timer
+        self.hunger_manager.write_nbt(nbt).await;
     }
 
     async fn read_nbt(&mut self, nbt: &mut NbtCompound) {
         self.living_entity.read_nbt(nbt).await;
-        self.inventory.lock().await.selected =
-            nbt.get_int("SelectedItemSlot").unwrap_or(0) as usize;
+        self.inventory.lock().await.read_nbt(nbt).await;
         self.abilities.lock().await.read_nbt(nbt).await;
+
+        self.gamemode.store(
+            GameMode::try_from(nbt.get_byte("playerGameType").unwrap_or(0))
+                .unwrap_or(GameMode::Survival),
+        );
+
+        self.has_played_before.store(
+            nbt.get_bool("HasPlayedBefore").unwrap_or(false),
+            Ordering::Relaxed,
+        );
+
+        // Load food level, saturation, exhaustion, and tick timer
+        self.hunger_manager.read_nbt(nbt).await;
 
         // Load from total XP
         let total_exp = nbt.get_int("XpTotal").unwrap_or(0);
@@ -1369,6 +1461,67 @@ impl NBTStorage for Player {
         self.experience_level.store(level, Ordering::Relaxed);
         self.experience_progress.store(progress);
         self.experience_points.store(points, Ordering::Relaxed);
+    }
+}
+
+#[async_trait]
+impl NBTStorage for PlayerInventory {
+    async fn write_nbt(&self, nbt: &mut NbtCompound) {
+        // Save the selected slot (hotbar)
+        nbt.put_int("SelectedItemSlot", self.selected as i32);
+
+        // Create inventory list with the correct capacity (inventory size)
+        let mut vec: Vec<NbtTag> = Vec::with_capacity(SLOT_OFFHAND);
+
+        // Helper function to add items to the vector
+        let mut add_item = |slot: usize, stack_ref: Option<&ItemStack>| {
+            if let Some(stack) = stack_ref {
+                let mut item_compound = NbtCompound::new();
+                item_compound.put_byte("Slot", slot as i8);
+                stack.write_item_stack(&mut item_compound);
+                vec.push(NbtTag::Compound(item_compound));
+            }
+        };
+
+        // Crafting input slots
+        for slot in SLOT_CRAFT_INPUT_START..=SLOT_CRAFT_INPUT_END {
+            add_item(slot, self.crafting_slots()[slot - SLOT_CRAFT_INPUT_START]);
+        }
+
+        // Armor slots
+        for slot in SLOT_HELM..=SLOT_BOOT {
+            add_item(slot, self.armor_slots()[slot - SLOT_HELM]);
+        }
+
+        // Main inventory slots (includes hotbar in the data structure)
+        for slot in SLOT_INV_START..=SLOT_HOTBAR_END {
+            add_item(slot, self.item_slots()[slot - SLOT_INV_START]);
+        }
+
+        // Offhand
+        add_item(SLOT_OFFHAND, self.offhand_slot());
+
+        // Save the inventory list
+        nbt.put("Inventory", NbtTag::List(vec.into_boxed_slice()));
+    }
+
+    async fn read_nbt(&mut self, nbt: &mut NbtCompound) {
+        // Read selected hotbar slot
+        self.selected = nbt.get_int("SelectedItemSlot").unwrap_or(0) as usize;
+
+        // Process inventory list
+        if let Some(inventory_list) = nbt.get_list("Inventory") {
+            for tag in inventory_list {
+                if let Some(item_compound) = tag.extract_compound() {
+                    if let Some(slot_byte) = item_compound.get_byte("Slot") {
+                        let slot = slot_byte as usize;
+                        if let Some(item_stack) = ItemStack::read_item_stack(item_compound) {
+                            let _ = self.set_slot(slot, Some(item_stack), true);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1549,12 +1702,16 @@ impl Player {
             SChunkBatch::PACKET_ID => {
                 self.handle_chunk_batch(SChunkBatch::read(payload)?).await;
             }
+            SPlayerSession::PACKET_ID => {
+                self.handle_chat_session_update(server, SPlayerSession::read(payload)?)
+                    .await;
+            }
             _ => {
                 log::warn!("Failed to handle player packet id {}", packet.id);
                 // TODO: We give an error if all play packets are implemented
                 //  return Err(Box::new(DeserializerError::UnknownPacket));
             }
-        };
+        }
         Ok(())
     }
 }
@@ -1698,5 +1855,134 @@ impl TryFrom<i32> for ChatMode {
             2 => Ok(Self::Hidden),
             _ => Err(InvalidChatMode),
         }
+    }
+}
+
+/// Player's current chat session
+pub struct ChatSession {
+    pub session_id: uuid::Uuid,
+    pub expires_at: i64,
+    pub public_key: Box<[u8]>,
+    pub signature: Box<[u8]>,
+    pub messages_sent: i32,
+    pub messages_received: i32,
+    pub signature_cache: Vec<Box<[u8]>>,
+}
+
+impl Default for ChatSession {
+    fn default() -> Self {
+        Self::new(Uuid::nil(), 0, Box::new([]), Box::new([]))
+    }
+}
+
+impl ChatSession {
+    #[must_use]
+    pub fn new(
+        session_id: Uuid,
+        expires_at: i64,
+        public_key: Box<[u8]>,
+        key_signature: Box<[u8]>,
+    ) -> Self {
+        Self {
+            session_id,
+            expires_at,
+            public_key,
+            signature: key_signature,
+            messages_sent: 0,
+            messages_received: 0,
+            signature_cache: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct LastSeen(Vec<Box<[u8]>>);
+
+impl From<LastSeen> for Vec<Box<[u8]>> {
+    fn from(seen: LastSeen) -> Self {
+        seen.0
+    }
+}
+
+impl AsRef<[Box<[u8]>]> for LastSeen {
+    fn as_ref(&self) -> &[Box<[u8]>] {
+        &self.0
+    }
+}
+
+impl LastSeen {
+    /// The sender's `last_seen` signatures are sent as ID's if the recipient has them in their cache.
+    /// Otherwise, the full signature is sent. (ID:0 indicates full signature is being sent)
+    pub async fn indexed_for(&self, recipient: &Arc<Player>) -> Box<[PreviousMessage]> {
+        let mut indexed = Vec::new();
+        for signature in &self.0 {
+            if let Some(index) = recipient
+                .signature_cache
+                .lock()
+                .await
+                .full_cache
+                .iter()
+                .position(|s| s == signature)
+            {
+                indexed.push(PreviousMessage {
+                    // Send ID reference to recipient's cache (index + 1 because 0 is reserved for full signature)
+                    id: VarInt(1 + index as i32),
+                    signature: None,
+                });
+            } else {
+                indexed.push(PreviousMessage {
+                    // Send ID as 0 for full signature
+                    id: VarInt(0),
+                    signature: Some(signature.clone()),
+                });
+            }
+        }
+        indexed.into_boxed_slice()
+    }
+}
+
+pub struct MessageCache {
+    /// max 128 cached message signatures. Most recent FIRST.
+    /// Server should (when possible) reference indexes in this (recipient's) cache instead of sending full signatures in last seen.
+    /// Must be 1:1 with client's signature cache.
+    full_cache: VecDeque<Box<[u8]>>,
+    /// max 20 last seen messages by the sender. Most Recent LAST
+    pub last_seen: LastSeen,
+}
+
+impl Default for MessageCache {
+    fn default() -> Self {
+        Self {
+            full_cache: VecDeque::with_capacity(MAX_CACHED_SIGNATURES as usize),
+            last_seen: LastSeen::default(),
+        }
+    }
+}
+
+impl MessageCache {
+    /// Not used for caching seen messages. Only for non-indexed signatures from senders.
+    pub fn cache_signatures(&mut self, signatures: &[Box<[u8]>]) {
+        for sig in signatures.iter().rev() {
+            if self.full_cache.contains(sig) {
+                continue;
+            }
+            // If the cache is maxed, and someone sends a signature older than the oldest in cache, ignore it
+            if self.full_cache.len() < MAX_CACHED_SIGNATURES as usize {
+                self.full_cache.push_back(sig.clone()); // Recipient never saw this message so it must be older than the oldest in cache
+            }
+        }
+    }
+
+    /// Adds a seen signature to `last_seen` and `full_cache`.
+    pub fn add_seen_signature(&mut self, signature: &[u8]) {
+        if self.last_seen.0.len() >= MAX_PREVIOUS_MESSAGES as usize {
+            self.last_seen.0.remove(0);
+        }
+        self.last_seen.0.push(signature.into());
+        // This probably doesn't need to be a loop, but better safe than sorry
+        while self.full_cache.len() >= MAX_CACHED_SIGNATURES as usize {
+            self.full_cache.pop_back();
+        }
+        self.full_cache.push_front(signature.into()); // Since recipient saw this message it will be most recent in cache
     }
 }

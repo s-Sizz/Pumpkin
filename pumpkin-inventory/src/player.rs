@@ -1,5 +1,4 @@
 use crate::container_click::MouseClick;
-use crate::crafting::check_if_matches_crafting;
 use crate::{Container, InventoryError, WindowType, handle_item_change};
 use pumpkin_data::item::Item;
 use pumpkin_world::item::ItemStack;
@@ -275,6 +274,24 @@ impl PlayerInventory {
         slots.into_boxed_slice()
     }
 
+    pub fn armor_slots(&self) -> Box<[Option<&ItemStack>]> {
+        self.armor.iter().map(|item| item.as_ref()).collect()
+    }
+
+    pub fn crafting_slots(&self) -> Box<[Option<&ItemStack>]> {
+        let mut slots = vec![self.crafting_output.as_ref()];
+        slots.extend(self.crafting.iter().map(|c| c.as_ref()));
+        slots.into_boxed_slice()
+    }
+
+    pub fn item_slots(&self) -> Box<[Option<&ItemStack>]> {
+        self.items.iter().map(|item| item.as_ref()).collect()
+    }
+
+    pub fn offhand_slot(&self) -> Option<&ItemStack> {
+        self.offhand.as_ref()
+    }
+
     pub fn iter_items_mut(&mut self) -> IterMut<Option<ItemStack>> {
         self.items.iter_mut()
     }
@@ -348,9 +365,9 @@ impl Container for PlayerInventory {
         let v1 = [self.crafting[0].as_ref(), self.crafting[1].as_ref(), None];
         let v2 = [self.crafting[2].as_ref(), self.crafting[3].as_ref(), None];
         let v3 = [const { None }; 3];
-        let together = [v1, v2, v3];
+        let _together = [v1, v2, v3];
 
-        self.crafting_output = check_if_matches_crafting(together);
+        self.crafting_output = None; //check_if_matches_crafting(together);
         self.crafting.iter().any(|s| s.is_some())
     }
 

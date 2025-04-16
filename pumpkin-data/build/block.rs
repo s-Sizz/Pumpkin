@@ -6,19 +6,6 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use syn::{Ident, LitBool, LitInt, LitStr};
 
-fn is_state_solid(state: &BlockState, all_shapes: &[CollisionShape]) -> bool {
-    // Needs min xyz to be 0,0,0 and max xyz to be 1,1,1
-    state.collision_shapes.iter().any(|shape| {
-        let shape = all_shapes.get(*shape as usize).unwrap();
-        shape.min[0] == 0.0
-            && shape.min[1] == 0.0
-            && shape.min[2] == 0.0
-            && shape.max[0] == 1.0
-            && shape.max[1] == 1.0
-            && shape.max[2] == 1.0
-    })
-}
-
 fn const_block_name_from_block_name(block: &str) -> String {
     block.to_shouty_snake_case()
 }
@@ -34,23 +21,23 @@ struct PropertyVariantMapping {
 
 struct PropertyCollectionData {
     variant_mappings: Vec<PropertyVariantMapping>,
-    block_names: Vec<String>,
+    blocks: Vec<(String, u16)>,
 }
 
 impl PropertyCollectionData {
-    pub fn add_block_name(&mut self, block_name: String) {
-        self.block_names.push(block_name);
+    pub fn add_block(&mut self, block_name: String, block_id: u16) {
+        self.blocks.push((block_name, block_id));
     }
 
     pub fn from_mappings(variant_mappings: Vec<PropertyVariantMapping>) -> Self {
         Self {
             variant_mappings,
-            block_names: Vec::new(),
+            blocks: Vec::new(),
         }
     }
 
     pub fn derive_name(&self) -> String {
-        format!("{}_like", self.block_names[0])
+        format!("{}_like", self.blocks[0].0)
     }
 }
 
@@ -161,7 +148,12 @@ impl ToTokens for BlockPropertyStruct {
             }
         });
 
-        let block_names = &self.data.block_names;
+        let block_ids = self
+            .data
+            .blocks
+            .iter()
+            .map(|(_, id)| *id)
+            .collect::<Vec<_>>();
 
         let field_names: Vec<_> = self
             .data
@@ -235,7 +227,7 @@ impl ToTokens for BlockPropertyStruct {
                 }
 
                 fn to_state_id(&self, block: &Block) -> u16 {
-                    if ![#(#block_names),*].contains(&block.name) {
+                    if ![#(#block_ids),*].contains(&block.id) {
                         panic!("{} is not a valid block for {}", &block.name, #struct_name);
                     }
 
@@ -243,7 +235,7 @@ impl ToTokens for BlockPropertyStruct {
                 }
 
                 fn from_state_id(state_id: u16, block: &Block) -> Self {
-                    if ![#(#block_names),*].contains(&block.name) {
+                    if ![#(#block_ids),*].contains(&block.id) {
                         panic!("{} is not a valid block for {}", &block.name, #struct_name);
                     }
 
@@ -256,7 +248,7 @@ impl ToTokens for BlockPropertyStruct {
                 }
 
                 fn default(block: &Block) -> Self {
-                    if ![#(#block_names),*].contains(&block.name) {
+                    if ![#(#block_ids),*].contains(&block.id) {
                         panic!("{} is not a valid block for {}", &block.name, #struct_name);
                     }
 
@@ -273,7 +265,7 @@ impl ToTokens for BlockPropertyStruct {
                 }
 
                 fn from_props(props: Vec<(String, String)>, block: &Block) -> Self {
-                    if ![#(#block_names),*].contains(&block.name) {
+                    if ![#(#block_ids),*].contains(&block.id) {
                         panic!("{} is not a valid block for {}", &block.name, #struct_name);
                     }
 
@@ -331,6 +323,8 @@ pub struct BlockState {
     pub collision_shapes: Vec<u16>,
     pub opacity: Option<u32>,
     pub block_entity_type: Option<u32>,
+    // pub instrument: String, // TODO: make this an enum
+    pub is_solid: bool,
     pub is_liquid: bool,
 }
 
@@ -341,7 +335,7 @@ pub struct BlockStateRef {
 }
 
 impl BlockState {
-    fn to_tokens(&self, all_shapes: &[CollisionShape]) -> TokenStream {
+    fn to_tokens(&self) -> TokenStream {
         let mut tokens = TokenStream::new();
         //let id = LitInt::new(&self.id.to_string(), Span::call_site());
         let air = LitBool::new(self.air, Span::call_site());
@@ -373,7 +367,7 @@ impl BlockState {
             .iter()
             .map(|shape_id| LitInt::new(&shape_id.to_string(), Span::call_site()));
 
-        let is_solid = is_state_solid(self, all_shapes);
+        let is_solid = LitBool::new(self.is_solid, Span::call_site());
 
         tokens.extend(quote! {
             PartialBlockState {
@@ -855,7 +849,7 @@ pub(crate) fn build() -> TokenStream {
     let mut type_from_name = TokenStream::new();
     let mut block_from_state_id = TokenStream::new();
     let mut block_from_item_id = TokenStream::new();
-    let mut block_properties_from_state_and_name = TokenStream::new();
+    let mut block_properties_from_state_and_block_id = TokenStream::new();
     let mut block_properties_from_props_and_name = TokenStream::new();
     let mut existing_item_ids: Vec<u16> = Vec::new();
     let mut constants = TokenStream::new();
@@ -965,7 +959,7 @@ pub(crate) fn build() -> TokenStream {
                 property_enum: renamed_property.clone(),
             });
 
-            // If this property doesnt have an `enum` yet, make one.
+            // If this property doesn't have an `enum` yet, make one.
             let _ = property_enums
                 .entry(renamed_property.clone())
                 .or_insert_with(|| PropertyStruct {
@@ -984,12 +978,12 @@ pub(crate) fn build() -> TokenStream {
             property_collection_map
                 .entry(property_collection)
                 .or_insert_with(|| PropertyCollectionData::from_mappings(property_mapping))
-                .add_block_name(block.name);
+                .add_block(block.name, block.id);
         }
     }
 
     for property_group in property_collection_map.into_values() {
-        for block_name in &property_group.block_names {
+        for (block_name, id) in &property_group.blocks {
             let const_block_name = Ident::new(
                 &const_block_name_from_block_name(block_name),
                 Span::call_site(),
@@ -998,13 +992,14 @@ pub(crate) fn build() -> TokenStream {
                 &property_group_name_from_derived_name(&property_group.derive_name()),
                 Span::call_site(),
             );
+            let id_lit = LitInt::new(&id.to_string(), Span::call_site());
 
-            block_properties_from_state_and_name.extend(quote! {
-                #block_name => Some(Box::new(#property_name::from_state_id(state_id, &Block::#const_block_name))),
+            block_properties_from_state_and_block_id.extend(quote! {
+                #id_lit => Some(Box::new(#property_name::from_state_id(state_id, &Block::#const_block_name))),
             });
 
             block_properties_from_props_and_name.extend(quote! {
-                #block_name => Some(Box::new(#property_name::from_props(props, &Block::#const_block_name))),
+                #id_lit => Some(Box::new(#property_name::from_props(props, &Block::#const_block_name))),
             });
         }
 
@@ -1019,9 +1014,7 @@ pub(crate) fn build() -> TokenStream {
         .iter()
         .map(|shape| shape.to_token_stream());
 
-    let unique_states = unique_states
-        .iter()
-        .map(|state| state.to_tokens(&blocks_assets.shapes));
+    let unique_states = unique_states.iter().map(|state| state.to_tokens());
 
     let block_props = block_properties.iter().map(|prop| prop.to_token_stream());
     let properties = property_enums.values().map(|prop| prop.to_token_stream());
@@ -1228,15 +1221,15 @@ pub(crate) fn build() -> TokenStream {
 
             #[doc = r" Get the properties of the block."]
             pub fn properties(&self, state_id: u16) -> Option<Box<dyn BlockProperties>> {
-                match self.name {
-                    #block_properties_from_state_and_name
+                match self.id {
+                    #block_properties_from_state_and_block_id
                     _ => None
                 }
             }
 
             #[doc = r" Get the properties of the block."]
             pub fn from_properties(&self, props: Vec<(String, String)>) -> Option<Box<dyn BlockProperties>> {
-                match self.name {
+                match self.id {
                     #block_properties_from_props_and_name
                     _ => None
                 }
@@ -1287,6 +1280,19 @@ pub(crate) fn build() -> TokenStream {
                     HorizontalFacing::South => HorizontalFacing::North,
                     HorizontalFacing::East => HorizontalFacing::West,
                     HorizontalFacing::West => HorizontalFacing::East
+                }
+            }
+        }
+
+        impl Facing {
+            pub fn opposite(&self) -> Self {
+                match self {
+                    Facing::North => Facing::South,
+                    Facing::South => Facing::North,
+                    Facing::East => Facing::West,
+                    Facing::West => Facing::East,
+                    Facing::Up => Facing::Down,
+                    Facing::Down => Facing::Up,
                 }
             }
         }

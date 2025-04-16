@@ -1,6 +1,7 @@
 use crate::block::registry::BlockRegistry;
 use crate::command::commands::default_dispatcher;
 use crate::command::commands::defaultgamemode::DefaultGamemode;
+use crate::data::player_server_data::ServerPlayerData;
 use crate::entity::EntityId;
 use crate::item::registry::ItemRegistry;
 use crate::net::EncryptionError;
@@ -26,6 +27,7 @@ use pumpkin_util::math::vector2::Vector2;
 use pumpkin_util::text::TextComponent;
 use pumpkin_world::dimension::Dimension;
 use rand::prelude::SliceRandom;
+use rsa::RsaPublicKey;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::AtomicU32;
@@ -39,18 +41,19 @@ use tokio_util::task::TaskTracker;
 
 mod connection_cache;
 mod key_store;
+pub mod seasonal_events;
 pub mod ticker;
 
-pub const CURRENT_MC_VERSION: &str = "1.21.4";
+pub const CURRENT_MC_VERSION: &str = "1.21.5";
 
 /// Represents a Minecraft server instance.
 pub struct Server {
     /// Handles cryptographic keys for secure communication.
     key_store: KeyStore,
     /// Manages server status information.
-    server_listing: Mutex<CachedStatus>,
+    listing: Mutex<CachedStatus>,
     /// Saves server branding information.
-    server_branding: CachedBranding,
+    branding: CachedBranding,
     /// Saves and dispatches commands to appropriate handlers.
     pub command_dispatcher: RwLock<CommandDispatcher>,
     /// Block behaviour.
@@ -71,11 +74,15 @@ pub struct Server {
     container_id: AtomicU32,
     /// Manages authentication with an authentication server, if enabled.
     pub auth_client: Option<reqwest::Client>,
+    /// Mojang's public keys, used for chat session signing
+    /// Pulled from Mojang API on startup
+    pub mojang_public_keys: Mutex<Vec<RsaPublicKey>>,
     /// The server's custom bossbars
     pub bossbars: Mutex<CustomBossbars>,
     /// The default gamemode when a player joins the server (reset every restart)
     pub defaultgamemode: Mutex<DefaultGamemode>,
-
+    /// Manages player data storage
+    pub player_data_storage: ServerPlayerData,
     tasks: TaskTracker,
 }
 
@@ -97,17 +104,17 @@ impl Server {
 
         // First register the default commands. After that, plugins can put in their own.
         let command_dispatcher = RwLock::new(default_dispatcher());
+        let world_path = BASIC_CONFIG.get_world_path();
 
         let block_registry = super::block::default_registry();
 
         let world = World::load(
-            Dimension::Overworld.into_level(
-                // TODO: load form config
-                "./world".parse().unwrap(),
-            ),
+            Dimension::Overworld.into_level(world_path.clone()),
             DimensionType::Overworld,
             block_registry.clone(),
         );
+
+        let world_name = world_path.to_str().unwrap();
 
         Self {
             cached_registry: Registry::get_synced(),
@@ -126,13 +133,18 @@ impl Server {
             item_registry: super::item::items::default_registry(),
             auth_client,
             key_store: KeyStore::new(),
-            server_listing: Mutex::new(CachedStatus::new()),
-            server_branding: CachedBranding::new(),
+            listing: Mutex::new(CachedStatus::new()),
+            branding: CachedBranding::new(),
             bossbars: Mutex::new(CustomBossbars::new()),
             defaultgamemode: Mutex::new(DefaultGamemode {
                 gamemode: BASIC_CONFIG.default_gamemode,
             }),
+            player_data_storage: ServerPlayerData::new(
+                format!("{world_name}/playerdata"),
+                Duration::from_secs(advanced_config().player_data.save_player_cron_interval),
+            ),
             tasks: TaskTracker::new(),
+            mojang_public_keys: Mutex::new(Vec::new()),
         }
     }
 
@@ -189,10 +201,22 @@ impl Server {
         // TODO: select default from config
         let world = &self.worlds.read().await[0];
 
-        let player = Arc::new(Player::new(client, world.clone(), gamemode).await);
+        let mut player = Player::new(client, world.clone(), gamemode).await;
+
+        // Load player data
+        if let Err(e) = self
+            .player_data_storage
+            .handle_player_join(&mut player)
+            .await
+        {
+            log::error!("Unexpected error loading player data: {e}");
+        }
+
+        // Wrap in Arc after data is loaded
+        let player = Arc::new(player);
+
         send_cancellable! {{
             PlayerLoginEvent::new(player.clone(), TextComponent::text("You have been kicked from the server"));
-
             'after: {
                 world
                     .add_player(player.gameprofile.id, player.clone())
@@ -201,7 +225,7 @@ impl Server {
                 if let Some(config) = player.client.config.lock().await.as_ref() {
                     // TODO: Config so we can also just ignore this hehe
                     if config.server_listing {
-                        self.server_listing.lock().await.add_player();
+                        self.listing.lock().await.add_player();
                     }
                 }
 
@@ -217,7 +241,7 @@ impl Server {
 
     pub async fn remove_player(&self) {
         // TODO: Config if we want decrease online
-        self.server_listing.lock().await.remove_player();
+        self.listing.lock().await.remove_player();
     }
 
     pub async fn shutdown(&self) {
@@ -254,7 +278,7 @@ impl Server {
             if container.is_location(location) {
                 if let Some(container_block) = container.get_block() {
                     if container_block.id == block.id {
-                        log::debug!("Found container id: {}", id);
+                        log::debug!("Found container id: {id}");
                         return Some(*id as u32);
                     }
                 }
@@ -278,7 +302,7 @@ impl Server {
             if container.is_location(location) {
                 if let Some(container_block) = container.get_block() {
                     if container_block.id == block.id {
-                        log::debug!("Found matching container id: {}", id);
+                        log::debug!("Found matching container id: {id}");
                         matching_container_ids.push(*id as u32);
                     }
                 }
@@ -320,7 +344,7 @@ impl Server {
         &self,
         message: &TextComponent,
         sender_name: &TextComponent,
-        chat_type: u32,
+        chat_type: u8,
         target_name: Option<&TextComponent>,
     ) {
         send_cancellable! {{
@@ -445,11 +469,11 @@ impl Server {
     }
 
     pub fn get_branding(&self) -> CPluginMessage<'_> {
-        self.server_branding.get_branding()
+        self.branding.get_branding()
     }
 
     pub fn get_status(&self) -> &Mutex<CachedStatus> {
-        &self.server_listing
+        &self.listing
     }
 
     pub fn encryption_request<'a>(
@@ -472,6 +496,10 @@ impl Server {
     async fn tick(&self) {
         for world in self.worlds.read().await.iter() {
             world.tick(self).await;
+        }
+
+        if let Err(e) = self.player_data_storage.tick(self).await {
+            log::error!("Error ticking player data: {e}");
         }
     }
 }

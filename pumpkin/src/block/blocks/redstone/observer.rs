@@ -1,12 +1,14 @@
+use std::sync::Arc;
+
+use crate::entity::player::Player;
 use async_trait::async_trait;
-use pumpkin_data::block::{
-    Block, BlockProperties, BlockState, Boolean, HorizontalFacing, ObserverLikeProperties,
-};
+use pumpkin_data::block::{Block, BlockProperties, BlockState, Boolean, ObserverLikeProperties};
 use pumpkin_macros::pumpkin_block;
 use pumpkin_protocol::server::play::SUseItemOn;
 use pumpkin_util::math::position::BlockPos;
 use pumpkin_world::{
-    block::{BlockDirection, FacingExt, HorizontalFacingExt},
+    BlockStateId,
+    block::{BlockDirection, FacingExt},
     chunk::TickPriority,
 };
 
@@ -29,17 +31,17 @@ impl PumpkinBlock for ObserverBlock {
         _face: &BlockDirection,
         _block_pos: &BlockPos,
         _use_item_on: &SUseItemOn,
-        player_direction: &HorizontalFacing,
+        player: &Player,
         _other: bool,
-    ) -> u16 {
+    ) -> BlockStateId {
         let mut props = ObserverLikeProperties::default(block);
-        props.facing = player_direction.to_block_direction().to_facing();
+        props.facing = player.living_entity.entity.get_facing();
         props.to_state_id(block)
     }
 
     async fn on_neighbor_update(
         &self,
-        _world: &World,
+        _world: &Arc<World>,
         _block: &Block,
         _block_pos: &BlockPos,
         _source_block: &Block,
@@ -47,7 +49,7 @@ impl PumpkinBlock for ObserverBlock {
     ) {
     }
 
-    async fn on_scheduled_tick(&self, world: &World, block: &Block, block_pos: &BlockPos) {
+    async fn on_scheduled_tick(&self, world: &Arc<World>, block: &Block, block_pos: &BlockPos) {
         let state = world.get_block_state(block_pos).await.unwrap();
         let mut props = ObserverLikeProperties::from_state_id(state.id, block);
 
@@ -81,15 +83,15 @@ impl PumpkinBlock for ObserverBlock {
         &self,
         world: &World,
         block: &Block,
-        state: u16,
+        state: BlockStateId,
         block_pos: &BlockPos,
         direction: &BlockDirection,
         _neighbor_pos: &BlockPos,
-        _neighbor_state: u16,
-    ) -> u16 {
+        _neighbor_state: BlockStateId,
+    ) -> BlockStateId {
         let props = ObserverLikeProperties::from_state_id(state, block);
 
-        if props.facing.to_block_direction() == *direction && !props.powered.to_bool() {
+        if &props.facing.to_block_direction() == direction && !props.powered.to_bool() {
             Self::schedule_tick(world, block_pos).await;
         }
 
@@ -103,7 +105,7 @@ impl PumpkinBlock for ObserverBlock {
         direction: &BlockDirection,
     ) -> bool {
         let props = ObserverLikeProperties::from_state_id(state.id, block);
-        props.facing.to_block_direction() == *direction
+        &props.facing.to_block_direction() == direction
     }
 
     async fn get_weak_redstone_power(
@@ -115,7 +117,7 @@ impl PumpkinBlock for ObserverBlock {
         direction: &BlockDirection,
     ) -> u8 {
         let props = ObserverLikeProperties::from_state_id(state.id, block);
-        if props.facing.to_block_direction() == *direction && props.powered.to_bool() {
+        if &props.facing.to_block_direction() == direction && props.powered.to_bool() {
             15
         } else {
             0
@@ -136,10 +138,10 @@ impl PumpkinBlock for ObserverBlock {
 
     async fn on_state_replaced(
         &self,
-        world: &World,
+        world: &Arc<World>,
         block: &Block,
         location: BlockPos,
-        old_state_id: u16,
+        old_state_id: BlockStateId,
         moved: bool,
     ) {
         if !moved {
@@ -157,7 +159,7 @@ impl PumpkinBlock for ObserverBlock {
 
 impl ObserverBlock {
     async fn update_neighbors(
-        world: &World,
+        world: &Arc<World>,
         block: &Block,
         block_pos: &BlockPos,
         props: &ObserverLikeProperties,

@@ -37,9 +37,8 @@ impl Client {
         ) {
             *self.config.lock().await = Some(PlayerConfig {
                 locale: client_information.locale,
-                view_distance: unsafe {
-                    NonZeroU8::new_unchecked(client_information.view_distance as u8)
-                },
+                // client_information.view_distance was checked above to be > 0 so compiler should optimize this out.
+                view_distance: NonZeroU8::new(client_information.view_distance as u8).unwrap(),
                 chat_mode,
                 chat_colors: client_information.chat_colors,
                 skin_parts: client_information.skin_parts,
@@ -139,7 +138,7 @@ impl Client {
         // TODO: allow plugins to access this
         log::debug!(
             "Received cookie_response[config]: key: \"{}\", has_payload: \"{}\", payload_length: \"{:?}\"",
-            packet.key.to_string(),
+            packet.key,
             packet.has_payload,
             packet.payload.as_ref().map(|p| p.len()),
         );

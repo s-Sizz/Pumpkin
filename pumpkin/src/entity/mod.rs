@@ -6,6 +6,7 @@ use crossbeam::atomic::AtomicCell;
 use living::LivingEntity;
 use player::Player;
 use pumpkin_data::{
+    block::{Facing, HorizontalFacing},
     damage::DamageType,
     entity::{EntityPose, EntityType},
     sound::{Sound, SoundCategory},
@@ -28,9 +29,12 @@ use pumpkin_util::math::{
     wrap_degrees,
 };
 use serde::Serialize;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicI32},
+use std::{
+    f32::consts::PI,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicI32, Ordering},
+    },
 };
 use tokio::sync::RwLock;
 
@@ -152,7 +156,6 @@ impl Entity {
             chunk_pos: AtomicCell::new(Vector2::new(floor_x, floor_z)),
             sneaking: AtomicBool::new(false),
             world: Arc::new(RwLock::new(world)),
-            // TODO: Load this from previous instance
             sprinting: AtomicBool::new(false),
             fall_flying: AtomicBool::new(false),
             yaw: AtomicCell::new(0.0),
@@ -358,6 +361,52 @@ impl Entity {
         }
     }
 
+    pub fn get_horizontal_facing(&self) -> HorizontalFacing {
+        let adjusted_yaw = (self.yaw.load() % 360.0 + 360.0) % 360.0; // Normalize yaw to [0, 360)
+
+        match adjusted_yaw {
+            0.0..=45.0 | 315.0..=360.0 => HorizontalFacing::South,
+            45.0..=135.0 => HorizontalFacing::West,
+            135.0..=225.0 => HorizontalFacing::North,
+            225.0..=315.0 => HorizontalFacing::East,
+            _ => HorizontalFacing::South, // Default case, should not occur
+        }
+    }
+
+    pub fn get_facing(&self) -> Facing {
+        let pitch = self.pitch.load() * (PI / 180.0);
+        let yaw = -self.yaw.load() * (PI / 180.0);
+
+        let sin_pitch = pitch.sin();
+        let cos_pitch = pitch.cos();
+        let sin_yaw = yaw.sin();
+        let cos_yaw = yaw.cos();
+
+        let abs_sin_yaw = sin_yaw.abs();
+        let abs_sin_pitch = sin_pitch.abs();
+        let abs_cos_yaw = cos_yaw.abs();
+
+        let o = abs_sin_yaw * cos_pitch.abs();
+
+        if abs_sin_yaw > abs_cos_yaw {
+            if abs_sin_pitch > o {
+                if sin_pitch < 0.0 {
+                    Facing::Up
+                } else {
+                    Facing::Down
+                }
+            } else if sin_yaw > 0.0 {
+                Facing::East
+            } else {
+                Facing::West
+            }
+        } else if cos_yaw > 0.0 {
+            Facing::South
+        } else {
+            Facing::North
+        }
+    }
+
     pub async fn set_sprinting(&self, sprinting: bool) {
         assert!(self.sprinting.load(std::sync::atomic::Ordering::Relaxed) != sprinting);
         self.sprinting
@@ -412,7 +461,7 @@ impl Entity {
         self.world
             .read()
             .await
-            .broadcast_packet_all(&CSetEntityMetadata::new(self.entity_id.into(), buf))
+            .broadcast_packet_all(&CSetEntityMetadata::new(self.entity_id.into(), buf.into()))
             .await;
     }
 
@@ -498,6 +547,7 @@ impl NBTStorage for Entity {
             "Rotation",
             NbtTag::List(vec![self.yaw.load().into(), self.pitch.load().into()].into_boxed_slice()),
         );
+        nbt.put_bool("OnGround", self.on_ground.load(Ordering::Relaxed));
 
         // todo more...
     }
@@ -507,7 +557,7 @@ impl NBTStorage for Entity {
         let x = position[0].extract_double().unwrap_or(0.0);
         let y = position[1].extract_double().unwrap_or(0.0);
         let z = position[2].extract_double().unwrap_or(0.0);
-        self.pos.store(Vector3::new(x, y, z));
+        self.set_pos(Vector3::new(x, y, z));
         let velocity = nbt.get_list("Motion").unwrap();
         let x = velocity[0].extract_double().unwrap_or(0.0);
         let y = velocity[1].extract_double().unwrap_or(0.0);
@@ -516,9 +566,10 @@ impl NBTStorage for Entity {
         let rotation = nbt.get_list("Rotation").unwrap();
         let yaw = rotation[0].extract_float().unwrap_or(0.0);
         let pitch = rotation[1].extract_float().unwrap_or(0.0);
-        self.yaw.store(yaw);
-        self.pitch.store(pitch);
-
+        self.set_rotation(yaw, pitch);
+        self.head_yaw.store(yaw);
+        self.on_ground
+            .store(nbt.get_bool("OnGround").unwrap_or(false), Ordering::Relaxed);
         // todo more...
     }
 }

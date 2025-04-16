@@ -1,9 +1,11 @@
 use chunk::ChunkConfig;
+use fun::FunConfig;
 use log::warn;
 use logging::LoggingConfig;
 use pumpkin_util::{Difficulty, GameMode, PermissionLvl};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use std::path::PathBuf;
 use std::{
     env, fs,
     net::{Ipv4Addr, SocketAddr},
@@ -11,11 +13,13 @@ use std::{
     path::Path,
     sync::LazyLock,
 };
+pub mod fun;
 pub mod logging;
 pub mod networking;
 
 pub mod resource_pack;
 
+pub use chat::ChatConfig;
 pub use commands::CommandsConfig;
 pub use networking::auth::AuthenticationConfig;
 pub use networking::compression::CompressionConfig;
@@ -26,12 +30,15 @@ pub use server_links::ServerLinksConfig;
 
 mod commands;
 
+mod chat;
 pub mod chunk;
 pub mod op;
+mod player_data;
 mod pvp;
 mod server_links;
 
 use networking::NetworkingConfig;
+use player_data::PlayerDataConfig;
 use resource_pack::ResourcePackConfig;
 
 const CONFIG_ROOT_FOLDER: &str = "config/";
@@ -90,8 +97,11 @@ pub struct AdvancedConfiguration {
     pub chunk: ChunkConfig,
     pub networking: NetworkingConfig,
     pub commands: CommandsConfig,
+    pub chat: ChatConfig,
     pub pvp: PVPConfig,
     pub server_links: ServerLinksConfig,
+    pub player_data: PlayerDataConfig,
+    pub fun: FunConfig,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -133,6 +143,10 @@ pub struct BasicConfiguration {
     pub use_favicon: bool,
     /// Path to server favicon
     pub favicon_path: String,
+    /// The default level name
+    pub default_level_name: String,
+    /// Whether chat messages should be signed or not
+    pub allow_chat_reports: bool,
 }
 
 impl Default for BasicConfiguration {
@@ -156,7 +170,15 @@ impl Default for BasicConfiguration {
             scrub_ips: true,
             use_favicon: true,
             favicon_path: "icon.png".to_string(),
+            default_level_name: "world".to_string(),
+            allow_chat_reports: false,
         }
+    }
+}
+
+impl BasicConfiguration {
+    pub fn get_world_path(&self) -> PathBuf {
+        format!("./{}", self.default_level_name).parse().unwrap()
     }
 }
 
@@ -221,8 +243,8 @@ impl LoadConfiguration for BasicConfiguration {
     }
 
     fn validate(&self) {
-        let min = unsafe { NonZeroU8::new_unchecked(2) };
-        let max = unsafe { NonZeroU8::new_unchecked(32) };
+        let min = NonZeroU8::new(2).unwrap();
+        let max = NonZeroU8::new(32).unwrap();
 
         assert!(
             self.view_distance.ge(&min),
@@ -236,6 +258,12 @@ impl LoadConfiguration for BasicConfiguration {
             assert!(
                 self.encryption,
                 "When online mode is enabled, encryption must be enabled"
+            )
+        }
+        if self.allow_chat_reports {
+            assert!(
+                self.online_mode,
+                "When allow_chat_reports is enabled, online_mode must be enabled"
             )
         }
     }
