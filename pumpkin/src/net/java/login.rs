@@ -85,7 +85,7 @@ impl JavaClient {
                 profile_actions: None,
             };
 
-            if server.advanced_config.networking.packet_compression.enabled {
+            if server.advanced_config.networking.java_compression.enabled {
                 self.enable_compression(server).await;
             }
 
@@ -198,7 +198,7 @@ impl JavaClient {
         let compression = server
             .advanced_config
             .networking
-            .packet_compression
+            .java_compression
             .info
             .clone();
         // We want to wait until we have sent the compression packet to the client

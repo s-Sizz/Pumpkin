@@ -2,7 +2,6 @@ use crate::{
     net::{ClientPlatform, DisconnectReason, GameProfile, PlayerConfig, bedrock::BedrockClient},
     server::Server,
 };
-use pumpkin_config::networking::compression::CompressionInfo;
 use pumpkin_protocol::bedrock::server::{
     login::ClientData, resource_pack_response::SResourcePackResponse,
 };
@@ -84,7 +83,11 @@ fn verify_oidc_token_path(
 }
 
 impl BedrockClient {
-    pub async fn handle_request_network_settings(&self, packet: SRequestNetworkSettings) {
+    pub async fn handle_request_network_settings(
+        &self,
+        packet: SRequestNetworkSettings,
+        server: &Server,
+    ) {
         if packet.protocol_version < CURRENT_BEDROCK_MC_PROTOCOL as i32 {
             self.send_game_packet(&CPlayStatus::OutdatedClient).await;
             return;
@@ -92,9 +95,21 @@ impl BedrockClient {
             self.send_game_packet(&CPlayStatus::OutdatedServer).await;
             return;
         }
-        self.send_game_packet(&CNetworkSettings::new(0, 0, false, 0, 0.0))
-            .await;
-        self.set_compression(CompressionInfo::default()).await;
+        let compression = server
+            .advanced_config
+            .networking
+            .bedrock_compression
+            .info
+            .clone();
+        self.send_game_packet(&CNetworkSettings::new(
+            compression.threshold as u16,
+            0,
+            false,
+            0,
+            0.0,
+        ))
+        .await;
+        self.set_compression(compression).await;
     }
 
     pub async fn handle_login(self: &Arc<Self>, packet: SLogin, server: &Server) -> Option<()> {
